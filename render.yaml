@@ -1,0 +1,30 @@
+# Render Blueprint - Auto-deploy configuration
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: sage-x3-firs-einvoicing
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app_x3:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: X3_BASE_URL
+        sync: false
+      - key: X3_FOLDER
+        sync: false
+      - key: X3_USERNAME
+        sync: false
+      - key: X3_PASSWORD
+        sync: false
+      - key: FIRS_API_URL
+        sync: false
+      - key: FIRS_API_KEY
+        sync: false
+      - key: FIRS_PARTICIPANT_ID
+        sync: false
+      - key: SUPPLIER_NAME
+        sync: false
+      - key: SUPPLIER_TIN
+        sync: false
