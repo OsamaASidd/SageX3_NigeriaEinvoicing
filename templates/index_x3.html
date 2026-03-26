@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-Invoicing Dashboard - Sage X3</title>
+    <style>
+        :root { --navy: #0f172a; --blue: #2563eb; --green: #16a34a; --red: #dc2626;
+            --amber: #d97706; --slate50: #f8fafc; --slate100: #f1f5f9; --slate200: #e2e8f0;
+            --slate400: #94a3b8; --slate500: #64748b; --slate600: #475569; --slate800: #1e293b; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--slate100); color: var(--slate800); }
+        .header { background: var(--navy); color: white; padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header-logo { width: 32px; height: 32px; background: var(--green); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; }
+        .header-title { font-size: 15px; font-weight: 600; }
+        .header-subtitle { font-size: 11px; opacity: 0.7; }
+        .header-env { background: var(--amber); color: white; font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 4px; }
+        .stats-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 20px 24px 0; }
+        .stat-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .stat-label { font-size: 11px; color: var(--slate500); text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat-value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+        .stat-card.posted .stat-value { color: var(--green); }
+        .stat-card.pending .stat-value { color: var(--amber); }
+        .stat-card.failed .stat-value { color: var(--red); }
+        .toolbar { display: flex; align-items: center; gap: 10px; padding: 16px 24px; flex-wrap: wrap; }
+        .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--slate200); border-radius: 6px; background: white; font-size: 13px; cursor: pointer; font-weight: 500; transition: all 0.15s; }
+        .btn:hover { background: var(--slate50); }
+        .btn-primary { background: var(--blue); color: white; border-color: var(--blue); }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        input[type="date"] { padding: 7px 10px; border: 1px solid var(--slate200); border-radius: 6px; font-size: 13px; }
+        .table-wrap { padding: 0 24px 20px; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        th { background: var(--slate50); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--slate500); padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--slate200); }
+        td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid var(--slate100); }
+        tr:hover { background: var(--slate50); }
+        .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .badge-posted { background: #dcfce7; color: #166534; }
+        .badge-pending { background: #fef3c7; color: #92400e; }
+        .badge-failed { background: #fee2e2; color: #991b1b; }
+        .badge-invoice { background: #dbeafe; color: #1e40af; }
+        .badge-credit { background: #fce7f3; color: #9d174d; }
+        .badge-debit { background: #fef3c7; color: #92400e; }
+        .error-text { font-size: 10px; color: var(--red); max-width: 200px; display: block; margin-top: 3px; }
+        .pagination { display: flex; justify-content: center; gap: 6px; padding: 0 24px 20px; }
+        .pagination a, .pagination span { padding: 6px 12px; border-radius: 6px; font-size: 13px; text-decoration: none; border: 1px solid var(--slate200); color: var(--slate600); }
+        .pagination .active { background: var(--blue); color: white; border-color: var(--blue); }
+        .sync-banner { padding: 10px 24px; background: #dcfce7; color: #166534; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+        .sync-banner.error { background: #fee2e2; color: #991b1b; }
+        .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.6s linear infinite; }
+        .spinner-dark { border-color: var(--slate200); border-top-color: var(--slate600); }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #toasts { position: fixed; top: 16px; right: 16px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+        .toast { background: white; padding: 12px 16px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); font-size: 13px; display: flex; align-items: center; gap: 8px; animation: slideIn 0.3s; max-width: 400px; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } }
+        .actions-cell { white-space: nowrap; display: flex; gap: 4px; align-items: center; }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal { background: white; border-radius: 12px; padding: 24px; max-width: 800px; width: 95%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .modal h3 { font-size: 16px; margin-bottom: 4px; }
+        .modal-subtitle { font-size: 12px; color: var(--slate500); margin-bottom: 16px; }
+        .modal-body { flex: 1; overflow: auto; }
+        .modal-body pre { background: var(--navy); color: #e2e8f0; padding: 16px; border-radius: 8px; font-size: 12px; line-height: 1.5; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+        .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        .btn-ghost { background: none; border: 1px solid var(--slate200); color: var(--slate600); padding: 5px 10px; font-size: 12px; border-radius: 4px; cursor: pointer; }
+        .btn-ghost:hover { background: var(--slate50); }
+        .preview-info { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; background: var(--slate50); padding: 10px; border-radius: 6px; font-size: 12px; }
+        .preview-info dt { color: var(--slate500); font-size: 10px; text-transform: uppercase; }
+        .preview-info dd { font-weight: 600; margin: 0; }
+    </style>
+</head>
+<body>
+
+<header class="header">
+    <div class="header-left">
+        <div class="header-logo">SO</div>
+        <div>
+            <div class="header-title">E-Invoicing Dashboard</div>
+            <div class="header-subtitle">Swift Oil Ltd - Sage X3</div>
+        </div>
+    </div>
+    <div class="header-right">
+        <span class="header-env">PREPROD</span>
+    </div>
+</header>
+
+<div class="sync-banner" id="syncBanner" style="display:none">
+    <span class="spinner spinner-dark" id="syncSpinner"></span>
+    <span id="syncBannerText">Syncing invoices from Sage X3...</span>
+</div>
+
+<div class="stats-bar">
+    <div class="stat-card"><div class="stat-label">Total Invoices</div><div class="stat-value">{{ stats.total }}</div></div>
+    <div class="stat-card pending"><div class="stat-label">Pending</div><div class="stat-value">{{ stats.pending }}</div></div>
+    <div class="stat-card posted"><div class="stat-label">Posted to FIRS</div><div class="stat-value">{{ stats.posted }}</div></div>
+    <div class="stat-card failed"><div class="stat-label">Failed</div><div class="stat-value">{{ stats.failed }}</div></div>
+</div>
+
+<div class="toolbar">
+    <label style="font-size:12px;color:var(--slate500)">From:</label>
+    <input type="date" id="dateFrom" value="{{ default_from }}">
+    <label style="font-size:12px;color:var(--slate500)">To:</label>
+    <input type="date" id="dateTo" value="{{ default_to }}">
+    <button class="btn" id="btnSync" onclick="syncSage()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        Sync from X3
+    </button>
+    <button class="btn btn-primary btn-sm" onclick="postAllPending()">Post All Pending</button>
+</div>
+
+<div class="table-wrap">
+<table>
+    <thead>
+        <tr>
+            <th>Invoice No.</th><th>Date</th><th>Customer</th><th>Type</th>
+            <th>Status</th><th style="text-align:right">Amount (NGN)</th><th>Actions</th><th>PDF</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for inv in invoices %}
+        <tr>
+            <td><strong>{{ inv.invoice_number }}</strong></td>
+            <td>{{ inv.invoice_date }}</td>
+            <td>{{ inv.customer_name }}</td>
+            <td>
+                {% if inv.invoice_type == 'Credit Note' %}
+                    <span class="badge badge-credit">Credit Note</span>
+                {% elif inv.invoice_type == 'Debit Note' %}
+                    <span class="badge badge-debit">Debit Note</span>
+                {% else %}
+                    <span class="badge badge-invoice">Invoice</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if inv.status == 'posted' %}<span class="badge badge-posted">POSTED</span>
+                {% elif inv.status == 'failed' %}<span class="badge badge-failed">FAILED</span>
+                    <button class="btn-ghost" onclick="showError('{{ inv.invoice_number }}')" title="View error" style="color:var(--red);font-size:11px;padding:2px 6px;margin-left:4px">Error</button>
+                {% else %}<span class="badge badge-pending">PENDING</span>{% endif %}
+            </td>
+            <td style="text-align:right;font-weight:600">{{ "{:,.2f}".format(inv.total_amount or 0) }}</td>
+            <td class="actions-cell">
+                {% if inv.status == 'posted' %}
+                    <span style="color:var(--green);font-size:12px;font-weight:600">Done</span>
+                {% elif inv.status == 'failed' %}
+                    <button class="btn btn-sm" style="background:var(--red);color:white" onclick="postInvoice('{{ inv.invoice_number }}', this)">Retry</button>
+                {% else %}
+                    <button class="btn btn-primary btn-sm" onclick="postInvoice('{{ inv.invoice_number }}', this)">Post</button>
+                {% endif %}
+                <button class="btn-ghost" onclick="previewPayload('{{ inv.invoice_number }}')" title="Preview JSON">{ }</button>
+            </td>
+            <td>
+                {% if inv.status == 'posted' %}
+                    <a href="/download/{{ inv.invoice_number }}" class="btn btn-sm" style="background:var(--green);color:white">PDF</a>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        {% if not invoices %}
+        <tr><td colspan="8" style="text-align:center;padding:40px;color:var(--slate400)">No invoices found. Click "Sync from X3" to load invoices.</td></tr>
+        {% endif %}
+    </tbody>
+</table>
+</div>
+
+{% if total_pages > 1 %}
+<div class="pagination">
+    {% if page > 1 %}<a href="?page={{ page - 1 }}">Prev</a>{% endif %}
+    {% for p in range(1, total_pages + 1) %}
+        {% if p == page %}<span class="active">{{ p }}</span>
+        {% elif p <= 3 or p > total_pages - 3 or (p >= page - 2 and p <= page + 2) %}<a href="?page={{ p }}">{{ p }}</a>
+        {% elif p == 4 or p == total_pages - 3 %}<span>...</span>{% endif %}
+    {% endfor %}
+    {% if page < total_pages %}<a href="?page={{ page + 1 }}">Next</a>{% endif %}
+</div>
+{% endif %}
+
+<div id="toasts"></div>
+
+<!-- Preview Modal -->
+<div class="modal-overlay" id="previewModal">
+    <div class="modal">
+        <h3 id="previewTitle">API Payload Preview</h3>
+        <div class="modal-subtitle" id="previewSubtitle"></div>
+        <div class="preview-info" id="previewInfo" style="display:none">
+            <div><dt>Subtotal</dt><dd id="pvSubtotal"></dd></div>
+            <div><dt>VAT</dt><dd id="pvVat"></dd></div>
+            <div><dt>Total</dt><dd id="pvGrand"></dd></div>
+        </div>
+        <div class="modal-body">
+            <pre id="previewJson">Loading...</pre>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-ghost" onclick="copyPayload()">Copy</button>
+            <button class="btn btn-sm" onclick="closePreview()">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Error Modal -->
+<div class="modal-overlay" id="errorModal">
+    <div class="modal">
+        <h3 id="errorTitle" style="color:var(--red)">API Error</h3>
+        <div class="modal-subtitle" id="errorSubtitle"></div>
+        <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px;margin-bottom:12px">
+            <div style="font-weight:600;color:#991b1b;font-size:13px" id="errorMessage"></div>
+        </div>
+        <div class="modal-body">
+            <pre id="errorJson">Loading...</pre>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-sm" onclick="closeError()">Close</button>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    var now = new Date();
+    var y = now.getFullYear(), m = String(now.getMonth()+1).padStart(2,'0');
+    document.getElementById('dateFrom').value = y + '-' + m + '-01';
+    var last = new Date(y, now.getMonth()+1, 0);
+    document.getElementById('dateTo').value = y + '-' + m + '-' + String(last.getDate()).padStart(2,'0');
+})();
+
+function toast(msg, type) {
+    var c = document.getElementById('toasts'), el = document.createElement('div');
+    el.className = 'toast';
+    el.innerHTML = '<span>' + msg + '</span>';
+    el.style.borderLeft = '4px solid ' + (type === 'success' ? '#16a34a' : type === 'error' ? '#dc2626' : '#2563eb');
+    c.appendChild(el);
+    setTimeout(function() { el.remove(); }, 4000);
+}
+
+function syncSage() {
+    var btn = document.getElementById('btnSync');
+    var df = document.getElementById('dateFrom').value, dt = document.getElementById('dateTo').value;
+    btn.disabled = true; btn.innerHTML = '<span class="spinner spinner-dark"></span> Syncing...';
+    fetch('/api/sync', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({date_from: df, date_to: dt}) })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) { toast('Synced ' + data.synced + ' invoices (' + data.new + ' new)', 'success'); setTimeout(function(){location.reload();}, 800); }
+            else { toast('Sync failed: ' + data.error, 'error'); btn.disabled = false; btn.textContent = 'Sync from X3'; }
+        }).catch(function(e) { toast('Error: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Sync from X3'; });
+}
+
+function postInvoice(invNum, btnEl) {
+    btnEl.disabled = true; btnEl.innerHTML = '<span class="spinner"></span>';
+    fetch('/api/post/' + encodeURIComponent(invNum), { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) { toast('Posted! IRN: ' + (data.irn||''), 'success'); setTimeout(function(){location.reload();}, 800); }
+            else { toast('Failed: ' + (data.error||'').substring(0, 80), 'error'); setTimeout(function(){location.reload();}, 1500); }
+        }).catch(function(e) { toast('Error: ' + e.message, 'error'); btnEl.disabled = false; });
+}
+
+function postAllPending() {
+    if (!confirm('Post all pending invoices to FIRS?')) return;
+    toast('Posting all pending...', 'info');
+    fetch('/api/post-bulk', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) { toast('Posted: ' + data.posted + ', Failed: ' + data.failed, data.failed > 0 ? 'error' : 'success'); setTimeout(function(){location.reload();}, 1000); }
+            else { toast('Bulk post failed: ' + data.error, 'error'); }
+        }).catch(function(e) { toast('Error: ' + e.message, 'error'); });
+}
+
+var _lastPayloadJson = '';
+function previewPayload(invNum) {
+    var modal = document.getElementById('previewModal');
+    var pre = document.getElementById('previewJson');
+    pre.textContent = 'Loading...';
+    document.getElementById('previewInfo').style.display = 'none';
+    document.getElementById('previewSubtitle').textContent = invNum;
+    modal.classList.add('active');
+    fetch('/api/preview-payload/' + encodeURIComponent(invNum))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) {
+                document.getElementById('previewTitle').textContent = data.invoice_number + ' - Payload';
+                document.getElementById('previewSubtitle').textContent = data.customer_name;
+                document.getElementById('pvSubtotal').textContent = 'N' + Number(data.subtotal).toLocaleString();
+                document.getElementById('pvVat').textContent = 'N' + Number(data.vat_amount).toLocaleString();
+                document.getElementById('pvGrand').textContent = 'N' + Number(data.grand_total).toLocaleString();
+                document.getElementById('previewInfo').style.display = 'grid';
+                _lastPayloadJson = JSON.stringify(data.payload, null, 2);
+                pre.textContent = _lastPayloadJson;
+            } else {
+                pre.textContent = 'Error: ' + (data.error || 'Unknown');
+            }
+        }).catch(function(e) { pre.textContent = 'Error: ' + e.message; });
+}
+function closePreview() { document.getElementById('previewModal').classList.remove('active'); }
+function copyPayload() { if (_lastPayloadJson) { navigator.clipboard.writeText(_lastPayloadJson); toast('Copied!', 'success'); } }
+document.getElementById('previewModal').addEventListener('click', function(e) { if (e.target === this) closePreview(); });
+
+function showError(invNum) {
+    var modal = document.getElementById('errorModal');
+    var pre = document.getElementById('errorJson');
+    pre.textContent = 'Loading...';
+    document.getElementById('errorSubtitle').textContent = invNum;
+    modal.classList.add('active');
+    fetch('/api/error-details/' + encodeURIComponent(invNum))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) {
+                document.getElementById('errorTitle').textContent = 'Error: ' + (data.invoice_number || invNum);
+                document.getElementById('errorMessage').textContent = data.error_message || 'No error message';
+                pre.textContent = typeof data.api_response === 'object' ? JSON.stringify(data.api_response, null, 2) : (data.api_response || 'No response');
+            } else {
+                pre.textContent = 'Could not load details';
+            }
+        }).catch(function(e) { pre.textContent = 'Error: ' + e.message; });
+}
+function closeError() { document.getElementById('errorModal').classList.remove('active'); }
+document.getElementById('errorModal').addEventListener('click', function(e) { if (e.target === this) closeError(); });
+</script>
+</body>
+</html>
