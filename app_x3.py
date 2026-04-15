@@ -179,8 +179,13 @@ COMPANY_FILTERS = [
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "einvoice_x3.db")
-PDF_DIR = os.path.join(BASE_DIR, "invoices_x3")
+# On Azure App Service Linux, /home is persistent storage that survives
+# redeploys. Use DATA_DIR env var (set to /home/data on Azure) to keep the DB
+# and generated PDFs out of wwwroot. Locally it falls back to the repo root.
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "einvoice_x3.db")
+PDF_DIR = os.path.join(DATA_DIR, "invoices_x3")
 os.makedirs(PDF_DIR, exist_ok=True)
 
 PER_PAGE = 25
@@ -198,7 +203,7 @@ _db_lock = threading.Lock()
 USERS = {
     "swift oil": {
         "password": "change@123",
-        "ctx": "swift",            # matches COMPANY_FILTERS key
+        "ctx": "swift",
         "label": "Swift Oil",
     },
     "chorus": {
