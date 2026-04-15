@@ -305,6 +305,32 @@ class SageX3Reader:
 
         return records
 
+    # Robust FLD parser: matches <FLD ...>value</FLD> with NAME attribute
+    # anywhere in the attribute list (not just first). Also picks up MENULAB.
+    _FLD_RE = re.compile(r'<FLD\b([^>]*?)>([^<]*)</FLD>')
+    _FLD_NAME_RE = re.compile(r'\bNAME="([^"]+)"')
+    _FLD_MENULAB_RE = re.compile(r'\bMENULAB="([^"]+)"')
+
+    def _extract_flds(self, content):
+        """Extract FLD fields from an XML chunk into {name: value}.
+
+        Also stores MENULAB (human label for enum fields) under "_{name}_label".
+        Handles attributes in any order.
+        """
+        out = {}
+        for m in self._FLD_RE.finditer(content):
+            attrs = m.group(1)
+            value = m.group(2)
+            name_m = self._FLD_NAME_RE.search(attrs)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            out[name] = value
+            label_m = self._FLD_MENULAB_RE.search(attrs)
+            if label_m:
+                out[f"_{name}_label"] = label_m.group(1)
+        return out
+
     def _parse_soap_read_response(self, xml_text):
         """Parse SOAP read response to extract full record with groups."""
         result = {}
@@ -319,10 +345,8 @@ class SageX3Reader:
         # Parse each GRP element
         grp_matches = re.findall(r'<GRP ID="([^"]+)">(.*?)</GRP>', result_xml, re.DOTALL)
         for grp_id, grp_content in grp_matches:
-            # Extract field values
-            fld_matches = re.findall(r'<FLD NAME="([^"]+)"[^>]*>([^<]*)</FLD>', grp_content)
-            for name, value in fld_matches:
-                result[name] = value
+            # Extract field values (attribute order agnostic + MENULAB capture)
+            result.update(self._extract_flds(grp_content))
 
             # Extract list values (for line items)
             lst_matches = re.findall(r'<LST NAME="([^"]+)"[^>]*>(.*?)</LST>', grp_content, re.DOTALL)
@@ -344,12 +368,7 @@ class SageX3Reader:
                 lin_num = lin_match.group(1)
                 lin_content = lin_match.group(2)
 
-                line = {}
-                # Extract all FLD values from this line
-                fld_matches = re.findall(r'<FLD NAME="([^"]+)"[^>]*>([^<]*)</FLD>', lin_content)
-                for name, value in fld_matches:
-                    line[name] = value
-
+                line = self._extract_flds(lin_content)
                 if line:  # Only add if we got some fields
                     lines.append(line)
 
@@ -526,7 +545,7 @@ class SageX3Reader:
     # SALES INVOICES (via SOAP - XSIH publication)
     # ----------------------------------------------------------------
 
-    def get_sales_invoices(self, from_date=None, to_date=None, limit=None):
+    def get_sales_invoices(self, from_date=None, to_date=None, limit=None, allowed_company_codes=None):
         """
         Fetch sales invoices from X3 via SOAP (XSIH publication).
 
@@ -538,10 +557,13 @@ class SageX3Reader:
             from_date: Start date (YYYY-MM-DD) - optional filter
             to_date: End date (YYYY-MM-DD) - optional filter
             limit: Maximum number of invoices
+            allowed_company_codes: If provided (list/set), only keep invoices
+                whose SALFCY is in this list.
 
         Returns:
             Dict of invoices keyed by invoice number
         """
+        allowed = set(allowed_company_codes) if allowed_company_codes else None
         # First, get list of invoice numbers via SOAP query
         invoice_list = self._soap_query("XSIH", list_size=limit or 1000)
 
@@ -573,6 +595,15 @@ class SageX3Reader:
             # Get full invoice details via SOAP read
             full_invoice = self._soap_read("XSIH", "NUM", inv_num)
             if not full_invoice:
+                continue
+
+            # Only bring in POSTED invoices (INVSTA -> MENULAB = "Posted")
+            if not self._is_posted(full_invoice):
+                continue
+
+            # Company/site filter (SALFCY)
+            salfcy = to_str(full_invoice.get("SALFCY", "")).strip()
+            if allowed is not None and salfcy not in allowed:
                 continue
 
             # Get customer info
@@ -607,6 +638,10 @@ class SageX3Reader:
                 "customer_city": cust.get("city", ""),
                 "customer_tin": cust.get("tin", ""),
                 "customer_country": cust.get("country", "NG"),
+                "company_code": to_str(full_invoice.get("SALFCY", "")),
+                "company_name": to_str(full_invoice.get("ZSALFCY", "")) or to_str(full_invoice.get("SALFCY", "")),
+                "status_code": to_str(full_invoice.get("INVSTA", "")),
+                "status_label": to_str(full_invoice.get("_INVSTA_label", "")),
                 "invoice_type": inv_type,
                 "currency": to_str(full_invoice.get("CUR", "NGN")),
                 "subtotal": abs(subtotal),
@@ -624,6 +659,22 @@ class SageX3Reader:
 
         logger.info(f"Processed {len(invoices)} invoices with line items")
         return invoices
+
+    def _is_posted(self, full_record):
+        """Return True if an X3 sales invoice/credit note is in the Posted state.
+
+        Prefers the MENULAB label on INVSTA (e.g. "Posted") since the numeric
+        value varies across X3 installations (commonly 2 or 3 for Posted).
+        Falls back to accepting numeric 2 or 3, or '' if the field is missing.
+        """
+        label = to_str(full_record.get("_INVSTA_label", "")).strip().lower()
+        if label:
+            return label == "posted"
+        val = to_str(full_record.get("INVSTA", "")).strip()
+        if val in ("2", "3"):
+            return True
+        # If the publication doesn't expose INVSTA at all, don't block everything.
+        return val == ""
 
     def _parse_x3_date(self, date_str):
         """Parse X3 date format (DD/MM/YYYY or YYYYMMDD) to YYYY-MM-DD."""
@@ -769,7 +820,7 @@ class SageX3Reader:
     # CREDIT NOTES (via SOAP - XCRN publication)
     # ----------------------------------------------------------------
 
-    def get_credit_notes(self, from_date=None, to_date=None, limit=None):
+    def get_credit_notes(self, from_date=None, to_date=None, limit=None, allowed_company_codes=None):
         """
         Fetch credit notes from X3 via SOAP (XCRN publication).
 
@@ -781,10 +832,13 @@ class SageX3Reader:
             from_date: Start date (YYYY-MM-DD) - optional filter
             to_date: End date (YYYY-MM-DD) - optional filter
             limit: Maximum number of credit notes
+            allowed_company_codes: If provided, only keep credit notes whose
+                SALFCY is in this list.
 
         Returns:
             Dict of credit notes keyed by credit note number
         """
+        allowed = set(allowed_company_codes) if allowed_company_codes else None
         # Get list of credit note numbers via SOAP query
         crn_list = self._soap_query("XCRN", list_size=limit or 1000)
 
@@ -816,6 +870,15 @@ class SageX3Reader:
             # Get full credit note details via SOAP read
             full_crn = self._soap_read("XCRN", "NUM", crn_num)
             if not full_crn:
+                continue
+
+            # Only bring in POSTED credit notes
+            if not self._is_posted(full_crn):
+                continue
+
+            # Company/site filter (SALFCY)
+            salfcy = to_str(full_crn.get("SALFCY", "")).strip()
+            if allowed is not None and salfcy not in allowed:
                 continue
 
             # Get customer info
@@ -885,6 +948,10 @@ class SageX3Reader:
                 "customer_city": cust.get("city", ""),
                 "customer_tin": cust.get("tin", ""),
                 "customer_country": cust.get("country", "NG"),
+                "company_code": to_str(full_crn.get("SALFCY", "")),
+                "company_name": to_str(full_crn.get("ZSALFCY", "")) or to_str(full_crn.get("SALFCY", "")),
+                "status_code": to_str(full_crn.get("INVSTA", "")),
+                "status_label": to_str(full_crn.get("_INVSTA_label", "")),
                 "invoice_type": "Credit Note",
                 "original_invoice": original_invoice,
                 "currency": to_str(full_crn.get("CUR", "NGN")),
@@ -908,7 +975,7 @@ class SageX3Reader:
     # XBIC PUBLICATION (Combined Invoices and Credit Notes)
     # ----------------------------------------------------------------
 
-    def get_xbic_documents(self, from_date=None, to_date=None, limit=None):
+    def get_xbic_documents(self, from_date=None, to_date=None, limit=None, allowed_company_codes=None):
         """
         Fetch documents from X3 via SOAP (XBIC publication).
         XBIC contains both invoices and credit notes in a single publication.
@@ -921,10 +988,13 @@ class SageX3Reader:
             from_date: Start date (YYYY-MM-DD) - optional filter
             to_date: End date (YYYY-MM-DD) - optional filter
             limit: Maximum number of documents
+            allowed_company_codes: If provided, only keep documents whose
+                SALFCY/FCY is in this list.
 
         Returns:
             Dict of documents keyed by document number
         """
+        allowed = set(allowed_company_codes) if allowed_company_codes else None
         # Get list of documents via SOAP query
         doc_list = self._soap_query("XBIC", list_size=limit or 1000)
 
@@ -956,6 +1026,15 @@ class SageX3Reader:
             # Get full document details via SOAP read
             full_doc = self._soap_read("XBIC", "NUM", doc_num)
             if not full_doc:
+                continue
+
+            # Only bring in POSTED documents
+            if not self._is_posted(full_doc):
+                continue
+
+            # Company/site filter (SALFCY / FCY)
+            salfcy = to_str(full_doc.get("SALFCY", "") or full_doc.get("FCY", "")).strip()
+            if allowed is not None and salfcy not in allowed:
                 continue
 
             # Get customer info
@@ -993,6 +1072,10 @@ class SageX3Reader:
                 "customer_city": cust.get("city", ""),
                 "customer_tin": cust.get("tin", ""),
                 "customer_country": cust.get("country", "NG"),
+                "company_code": to_str(full_doc.get("SALFCY", "") or full_doc.get("FCY", "")),
+                "company_name": to_str(full_doc.get("ZSALFCY", "") or full_doc.get("ZFCY", "")) or to_str(full_doc.get("SALFCY", "") or full_doc.get("FCY", "")),
+                "status_code": to_str(full_doc.get("INVSTA", "")),
+                "status_label": to_str(full_doc.get("_INVSTA_label", "")),
                 "invoice_type": doc_type,
                 "original_invoice": original_invoice,
                 "currency": to_str(full_doc.get("CUR", "NGN")),
@@ -1057,7 +1140,7 @@ class SageX3Reader:
                 "unit": "EA",
             })
 
-    def get_all_documents(self, from_date=None, to_date=None, limit=None, sources=None):
+    def get_all_documents(self, from_date=None, to_date=None, limit=None, sources=None, allowed_company_codes=None):
         """
         Fetch documents from X3 using multiple publications.
 
@@ -1067,6 +1150,7 @@ class SageX3Reader:
             limit: Maximum records per publication
             sources: List of publications to use. Default: ["XSIH", "XCRN", "XBIC"]
                      Options: "XSIH" (invoices), "XCRN" (credit notes), "XBIC" (both)
+            allowed_company_codes: List/set of SALFCY codes to keep. None = all.
 
         Returns:
             Dict of all documents keyed by document number
@@ -1079,7 +1163,7 @@ class SageX3Reader:
         # Get from XSIH (Sales Invoices)
         if "XSIH" in sources:
             try:
-                invoices = self.get_sales_invoices(from_date=from_date, to_date=to_date, limit=limit)
+                invoices = self.get_sales_invoices(from_date=from_date, to_date=to_date, limit=limit, allowed_company_codes=allowed_company_codes)
                 for inv_num, inv in invoices.items():
                     inv["source"] = "XSIH"
                     all_docs[inv_num] = inv
@@ -1090,7 +1174,7 @@ class SageX3Reader:
         # Get from XCRN (Credit Notes)
         if "XCRN" in sources:
             try:
-                credit_notes = self.get_credit_notes(from_date=from_date, to_date=to_date, limit=limit)
+                credit_notes = self.get_credit_notes(from_date=from_date, to_date=to_date, limit=limit, allowed_company_codes=allowed_company_codes)
                 for crn_num, crn in credit_notes.items():
                     crn["source"] = "XCRN"
                     all_docs[crn_num] = crn
@@ -1101,7 +1185,7 @@ class SageX3Reader:
         # Get from XBIC (Combined)
         if "XBIC" in sources:
             try:
-                xbic_docs = self.get_xbic_documents(from_date=from_date, to_date=to_date, limit=limit)
+                xbic_docs = self.get_xbic_documents(from_date=from_date, to_date=to_date, limit=limit, allowed_company_codes=allowed_company_codes)
                 for doc_num, doc in xbic_docs.items():
                     # Only add if not already present (XSIH/XCRN take precedence)
                     if doc_num not in all_docs:

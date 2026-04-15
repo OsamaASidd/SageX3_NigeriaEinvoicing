@@ -20,7 +20,8 @@ import threading
 import requests
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-from flask import Flask, render_template, jsonify, send_file, request
+from functools import wraps
+from flask import Flask, render_template, jsonify, send_file, request, session, redirect, url_for
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -33,34 +34,148 @@ from config_x3 import (
 )
 
 # ============================================================
-# CONFIGURATION - Update these for Swift Oil
+# CONFIGURATION
 # ============================================================
 # X3 Connection loaded from config_x3.py
 
-# FIRS API (Cryptware Systems)
-API_URL = API_BASE_URL
-API_HEADERS = {
-    "Content-Type": "application/json",
-    "x-api-key": API_KEY,
-}
+# FIRS environment switch: "test" or "prod"
+FIRS_ENV = os.environ.get("FIRS_ENV", "test").strip().lower()
 
-# Supplier Info (Swift Oil)
-SUPPLIER = {
-    "name": os.environ.get("SUPPLIER_NAME", "SWIFT OIL LIMITED"),
-    "address": "Lagos, Nigeria",
-    "tin": os.environ.get("SUPPLIER_TIN", ""),  # SET THIS!
-    "email": "info@swiftoil.com",
-    "telephone": "+234",
-    "business_id": API_HEADERS.get("participant-id", ""),
+# Shared FIRS endpoints (same for all companies)
+FIRS_TEST_URL = os.environ.get("FIRS_TEST_URL", "https://preprod-api.cryptwaresystemsltd.com")
+FIRS_PROD_URL = os.environ.get("FIRS_PROD_URL", "https://api.cryptwaresystemsltd.com")
+
+# Shared supplier defaults (both companies are in Lagos, NG)
+_DEFAULT_ADDRESS = {
     "street_name": "Lagos",
     "city_name": "Lagos",
     "postal_zone": "100001",
     "country": "NG",
 }
 
+# Fallback API config — only used if an invoice can't be resolved to a company
+DEFAULT_API_URL = FIRS_TEST_URL if FIRS_ENV == "test" else FIRS_PROD_URL
+DEFAULT_API_KEY = API_KEY  # legacy FIRS_API_KEY fallback
+
+def _env(name, default=""):
+    v = os.environ.get(name, default)
+    return v if v is not None else default
+
+LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo")
+
+# Per-company FIRS config. URL is shared; only keys and supplier identity vary.
+COMPANY_API_CONFIG = {
+    "SWI03": {
+        "name": "Swift Oil",
+        "logo": os.path.join(LOGO_DIR, "swiftoil.jpg"),
+        "test": {"url": FIRS_TEST_URL, "key": _env("SWIFT_FIRS_TEST_KEY")},
+        "prod": {"url": FIRS_PROD_URL, "key": _env("SWIFT_FIRS_PROD_KEY")},
+        "supplier": {
+            "name": _env("SWIFT_SUPPLIER_NAME", "Swift Oil Limited"),
+            "tin": _env("SWIFT_SUPPLIER_TIN", ""),
+            "email": _env("SWIFT_SUPPLIER_EMAIL", "info@swiftoil.com"),
+            "telephone": _env("SWIFT_SUPPLIER_PHONE", "+234"),
+            "business_description": "Oil and Gas Distribution",
+            **_DEFAULT_ADDRESS,
+        },
+    },
+    "CHO01": {
+        "name": "Chorus Energy",
+        "logo": os.path.join(LOGO_DIR, "chorusEnergy.png"),
+        "test": {"url": FIRS_TEST_URL, "key": _env("CHORUS_FIRS_TEST_KEY")},
+        "prod": {"url": FIRS_PROD_URL, "key": _env("CHORUS_FIRS_PROD_KEY")},
+        "supplier": {
+            "name": _env("CHORUS_SUPPLIER_NAME", "Chorus Energy Limited"),
+            "tin": _env("CHORUS_SUPPLIER_TIN", ""),
+            "email": _env("CHORUS_SUPPLIER_EMAIL", "info@chorusenergy.com"),
+            "telephone": _env("CHORUS_SUPPLIER_PHONE", "+234"),
+            "business_description": "Energy Distribution",
+            **_DEFAULT_ADDRESS,
+        },
+    },
+}
+
+# Legacy name -> code map so rows that still only have company_name can be
+# resolved to their company_code for credential lookup.
+LEGACY_NAME_TO_CODE = {
+    "SWIFT OIL  LEKKI": "SWI03",
+    "SWIFT OIL LEKKI": "SWI03",
+    "SWIFT LEKK": "SWI03",
+    "CHORUS ENERGY  LEKKI": "CHO01",
+    "CHORUS ENERGY LEKKI": "CHO01",
+}
+
+def resolve_company_code(inv_row):
+    """Return the best-guess X3 SALFCY code for a DB invoice row."""
+    code = (inv_row.get("company_code") or "").strip()
+    if code:
+        return code
+    name = (inv_row.get("company_name") or "").strip()
+    return LEGACY_NAME_TO_CODE.get(name, "")
+
+def get_company_api(company_code):
+    """Return (url, api_key, supplier, logo_path) for a company, honoring FIRS_ENV.
+
+    Falls back to DEFAULT_API_URL/KEY if the company has no config.
+    """
+    cfg = COMPANY_API_CONFIG.get(company_code or "")
+    if not cfg:
+        return DEFAULT_API_URL, DEFAULT_API_KEY, _default_supplier(), None
+    env_cfg = cfg.get(FIRS_ENV) or cfg.get("test") or {}
+    url = env_cfg.get("url") or DEFAULT_API_URL
+    key = env_cfg.get("key") or DEFAULT_API_KEY
+    supplier = cfg.get("supplier") or _default_supplier()
+    logo = cfg.get("logo")
+    return url, key, supplier, logo
+
+def _default_supplier():
+    # Rarely used: only hit when an invoice can't be mapped to a known company.
+    # Falls back to the first configured company's supplier profile.
+    first = next(iter(COMPANY_API_CONFIG.values()), None)
+    if first:
+        return dict(first["supplier"])
+    return {"name": "Unknown", "tin": "", "email": "", "telephone": "+234",
+            "business_description": "", **_DEFAULT_ADDRESS}
+
+# Legacy global — kept so any other caller that still references it doesn't
+# break, but post_to_firs now uses get_company_api() instead.
+API_URL = DEFAULT_API_URL
+API_HEADERS = {
+    "Content-Type": "application/json",
+    "x-api-key": DEFAULT_API_KEY,
+}
+SUPPLIER = _default_supplier()
+
 # Tax categories
 TAX_CAT_STANDARD = os.environ.get("TAX_CAT_STANDARD", "STANDARD_VAT")
 TAX_CAT_EXEMPT = os.environ.get("TAX_CAT_EXEMPT", "ZERO_VAT")
+
+# Only sync invoices from these X3 sales sites. Leave blank to sync everything.
+# Override via env var: ALLOWED_COMPANY_CODES="SWI03,CHO01"
+ALLOWED_COMPANY_CODES = [
+    c.strip() for c in os.environ.get("ALLOWED_COMPANY_CODES", "SWI03,CHO01").split(",")
+    if c.strip()
+]
+
+# Display-name -> code mapping for dashboard filter UI.
+# "label" is what the user sees, "codes" is the set of X3 SALFCY codes it maps to,
+# "names" are legacy company_name variants to also match (for rows synced before
+# company_code existed, or X3 records where the same site has multiple display
+# labels like "SWIFT LEKK" vs "SWIFT OIL LEKKI" — both are SWI03).
+COMPANY_FILTERS = [
+    {
+        "key": "swift",
+        "label": "Swift Oil",
+        "codes": ["SWI03"],
+        "names": ["SWIFT OIL  LEKKI", "SWIFT OIL LEKKI", "SWIFT LEKK"],
+    },
+    {
+        "key": "chorus",
+        "label": "Chorus",
+        "codes": ["CHO01"],
+        "names": ["CHORUS ENERGY  LEKKI", "CHORUS ENERGY LEKKI"],
+    },
+]
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,7 +185,44 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 PER_PAGE = 25
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "einvoice-x3-secret-key-change-me")
+# Auto-reload templates when files change (so HTML edits don't require restart)
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 _db_lock = threading.Lock()
+
+# ============================================================
+# AUTHENTICATION — each user is locked to one company
+# ============================================================
+
+USERS = {
+    "swift oil": {
+        "password": "change@123",
+        "ctx": "swift",            # matches COMPANY_FILTERS key
+        "label": "Swift Oil",
+    },
+    "chorus": {
+        "password": "Star@123",
+        "ctx": "chorus",
+        "label": "Chorus Energy",
+    },
+}
+
+def login_required(f):
+    """Decorator: redirect to /login if user is not authenticated."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+def get_session_ctx():
+    """Return the company filter dict for the logged-in user."""
+    user = USERS.get(session.get("user", ""))
+    if not user:
+        return COMPANY_FILTERS[0]
+    return next((f for f in COMPANY_FILTERS if f["key"] == user["ctx"]), COMPANY_FILTERS[0])
 
 # ============================================================
 # DATABASE
@@ -171,6 +323,18 @@ def init_db():
             except:
                 pass  # Column already exists
 
+            # Add company_name column (X3 sales site name, e.g. "SWIFT OIL LEKKI")
+            try:
+                conn.execute("ALTER TABLE invoices ADD COLUMN company_name TEXT")
+            except:
+                pass  # Column already exists
+
+            # Add company_code column (X3 SALFCY, e.g. "SWI03")
+            try:
+                conn.execute("ALTER TABLE invoices ADD COLUMN company_code TEXT")
+            except:
+                pass  # Column already exists
+
             conn.execute("""CREATE TABLE IF NOT EXISTS invoice_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invoice_number TEXT,
@@ -223,8 +387,13 @@ def sync_from_x3(date_from=None, date_to=None):
         return {"ok": False, "error": "Could not connect to Sage X3. Check credentials."}
 
     try:
-        # Fetch invoices AND credit notes from X3
-        invoices = reader.get_all_documents(from_date=date_from, to_date=date_to, limit=500)
+        # Fetch invoices AND credit notes from X3, restricted to allowed company codes
+        invoices = reader.get_all_documents(
+            from_date=date_from,
+            to_date=date_to,
+            limit=500,
+            allowed_company_codes=ALLOWED_COMPANY_CODES or None,
+        )
 
         if not invoices:
             return {"ok": True, "synced": 0, "new": 0, "message": "No invoices/credit notes found in date range"}
@@ -247,14 +416,15 @@ def sync_from_x3(date_from=None, date_to=None):
                             customer_email=?, customer_phone=?, customer_address=?,
                             customer_city=?, invoice_date=?, subtotal=?, vat_amount=?,
                             total_amount=?, currency=?, invoice_description=?,
-                            invoice_type=?, last_synced=?
+                            invoice_type=?, company_name=?, company_code=?, last_synced=?
                         WHERE invoice_number=?
                     """, (
                         inv["customer_name"], inv["customer_id"], inv["customer_tin"],
                         inv["customer_email"], inv["customer_phone"], inv["customer_address"],
                         inv["customer_city"], inv["date"], inv.get("subtotal", 0),
                         inv.get("vat_amount", 0), inv["total_amount"], inv.get("currency", "NGN"),
-                        inv.get("description", ""), inv.get("invoice_type", "Invoice"), now,
+                        inv.get("description", ""), inv.get("invoice_type", "Invoice"),
+                        inv.get("company_name", ""), inv.get("company_code", ""), now,
                         inv_num
                     )))
             else:
@@ -265,15 +435,17 @@ def sync_from_x3(date_from=None, date_to=None):
                         invoice_number, customer_name, customer_id, customer_tin,
                         customer_email, customer_phone, customer_address, customer_city,
                         invoice_date, subtotal, vat_amount, total_amount, currency,
-                        status, invoice_description, invoice_type, original_invoice, last_synced
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)
+                        status, invoice_description, invoice_type, original_invoice,
+                        company_name, company_code, last_synced
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?)
                 """, (
                     inv_num, inv["customer_name"], inv["customer_id"], inv["customer_tin"],
                     inv["customer_email"], inv["customer_phone"], inv["customer_address"],
                     inv["customer_city"], inv["date"], inv.get("subtotal", 0),
                     inv.get("vat_amount", 0), inv["total_amount"], inv.get("currency", "NGN"),
                     inv.get("description", ""), inv.get("invoice_type", "Invoice"),
-                    inv.get("original_invoice", ""), now
+                    inv.get("original_invoice", ""), inv.get("company_name", ""),
+                    inv.get("company_code", ""), now
                 )))
 
             # Sync line items
@@ -492,12 +664,32 @@ def build_payload(invoice_number):
 # ============================================================
 
 def post_to_firs(invoice_number):
-    """Post an invoice to FIRS via Cryptware API."""
+    """Post an invoice to FIRS via Cryptware API.
+
+    Resolves the API URL + key + supplier profile per-company so Swift Oil
+    and Chorus invoices go to their own accounts.
+    """
     inv = db_read_one("SELECT * FROM invoices WHERE invoice_number=?", (invoice_number,))
     if not inv:
         return {"ok": False, "error": "Not found"}
     if inv["status"] == "posted":
         return {"ok": False, "error": "Already posted", "irn": inv["irn"]}
+
+    # Resolve which FIRS account this invoice belongs to
+    company_code = resolve_company_code(inv)
+    api_url, api_key, _supplier, _logo = get_company_api(company_code)
+    if not api_key:
+        msg = f"No FIRS API key configured for company {company_code or '(unknown)'}"
+        db_write(
+            "UPDATE invoices SET status='failed', error_message=? WHERE invoice_number=?",
+            (msg[:500], invoice_number),
+        )
+        return {"ok": False, "error": msg}
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+    }
 
     payload, lines, vat_amount, build_error = build_payload(invoice_number)
     if not payload:
@@ -516,8 +708,8 @@ def post_to_firs(invoice_number):
     try:
         # Cryptware API endpoint: POST /invoice/generate
         resp = requests.post(
-            f"{API_URL}/invoice/generate",
-            headers=API_HEADERS,
+            f"{api_url}/invoice/generate",
+            headers=headers,
             json=payload,
             timeout=60
         )
@@ -632,6 +824,12 @@ def generate_pdf(invoice_number):
     if not inv:
         return None
 
+    # Look up the supplier profile for this invoice's company
+    _, _, supplier, logo_path = get_company_api(resolve_company_code(inv))
+    supplier_address = ", ".join(
+        p for p in [supplier.get("street_name"), supplier.get("city_name")] if p
+    ) or "Lagos, Nigeria"
+
     # Download QR code image from URL (Cryptware returns a Cloudinary image URL)
     qr_img_reader = None
     if inv.get("qr_code"):
@@ -678,11 +876,25 @@ def generate_pdf(invoice_number):
     # Header
     c.setFillColor(navy)
     c.rect(0, y - 60, w, 70, fill=True, stroke=False)
+
+    # Company logo (left side of header)
+    logo_x_offset = 30
+    if logo_path and os.path.exists(logo_path):
+        try:
+            logo_img = ImageReader(logo_path)
+            logo_h = 50
+            iw, ih = logo_img.getSize()
+            logo_w = logo_h * (iw / ih)  # maintain aspect ratio
+            c.drawImage(logo_img, 30, y - 55, width=logo_w, height=logo_h, mask="auto")
+            logo_x_offset = 30 + logo_w + 10  # shift text right of logo
+        except Exception as e:
+            print(f"Warning: Could not load logo: {e}")
+
     c.setFillColor(colors.white)
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(30, y - 25, SUPPLIER["name"])
+    c.drawString(logo_x_offset, y - 25, supplier.get("name", ""))
     c.setFont("Helvetica", 9)
-    c.drawString(30, y - 42, SUPPLIER["address"])
+    c.drawString(logo_x_offset, y - 42, supplier_address)
 
     # E-Invoice badge
     c.setFillColor(green)
@@ -841,30 +1053,96 @@ def generate_pdf(invoice_number):
 # FLASK ROUTES
 # ============================================================
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip().lower()
+        password = request.form.get("password") or ""
+        user = USERS.get(username)
+        if user and user["password"] == password:
+            session["user"] = username
+            return redirect(url_for("index"))
+        error = "Invalid username or password"
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
     page = request.args.get("page", 1, type=int)
+    # Company context is locked to the logged-in user
+    ctx_filter = get_session_ctx()
+    ctx = ctx_filter["key"]
+    status = (request.args.get("status") or "").strip().lower()
+    q = (request.args.get("q") or "").strip()
+
+    # Build the company WHERE clause (always active — scoped by header tab)
+    where_parts = []
+    params = []
+
+    or_parts = []
+    if ctx_filter.get("codes"):
+        code_ph = ",".join("?" * len(ctx_filter["codes"]))
+        or_parts.append(f"company_code IN ({code_ph})")
+        params.extend(ctx_filter["codes"])
+    if ctx_filter.get("names"):
+        name_ph = ",".join("?" * len(ctx_filter["names"]))
+        or_parts.append(f"company_name IN ({name_ph})")
+        params.extend(ctx_filter["names"])
+    if or_parts:
+        where_parts.append("(" + " OR ".join(or_parts) + ")")
+
+    # Stats scoped to the active company
     try:
-        total_row = db_read_one("SELECT COUNT(*) as cnt FROM invoices")
+        where_sql_stats = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        all_stats = db_read(
+            f"SELECT status, COUNT(*) as cnt FROM invoices{where_sql_stats} GROUP BY status",
+            tuple(params),
+        )
+        stats = {"total": 0, "posted": 0, "pending": 0, "failed": 0}
+        for s in all_stats:
+            stats[s["status"]] = s["cnt"]
+            stats["total"] += s["cnt"]
+    except:
+        stats = {"total": 0, "posted": 0, "pending": 0, "failed": 0}
+
+    # Additional filters (status, search) on top of company scope
+    if status in ("pending", "posted", "failed"):
+        where_parts.append("status = ?")
+        params.append(status)
+
+    if q:
+        where_parts.append("(invoice_number LIKE ? OR customer_name LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like])
+
+    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    try:
+        total_row = db_read_one(
+            f"SELECT COUNT(*) as cnt FROM invoices{where_sql}",
+            tuple(params),
+        )
         total = total_row["cnt"] if total_row else 0
         total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
         page = max(1, min(page, total_pages))
         offset = (page - 1) * PER_PAGE
 
         invoices = db_read(
-            "SELECT * FROM invoices ORDER BY invoice_date DESC, invoice_number DESC LIMIT ? OFFSET ?",
-            (PER_PAGE, offset)
+            f"SELECT * FROM invoices{where_sql} "
+            f"ORDER BY invoice_date DESC, invoice_number DESC LIMIT ? OFFSET ?",
+            tuple(params) + (PER_PAGE, offset),
         )
-
-        all_stats = db_read("SELECT status, COUNT(*) as cnt FROM invoices GROUP BY status")
-        stats = {"total": 0, "posted": 0, "pending": 0, "failed": 0}
-        for s in all_stats:
-            stats[s["status"]] = s["cnt"]
-            stats["total"] += s["cnt"]
-
-    except:
+    except Exception as e:
+        print(f"[index] query error: {e}")
         invoices = []
-        stats = {"total": 0, "posted": 0, "pending": 0, "failed": 0}
         total = 0
         total_pages = 1
         page = 1
@@ -884,11 +1162,18 @@ def index():
         total_pages=total_pages,
         total=total,
         default_from=default_from.strftime("%Y-%m-%d"),
-        default_to=today.strftime("%Y-%m-%d")
+        default_to=today.strftime("%Y-%m-%d"),
+        company_filters=COMPANY_FILTERS,
+        active_ctx=ctx,
+        active_ctx_label=ctx_filter["label"],
+        firs_env_label="PREPROD" if FIRS_ENV == "test" else "PRODUCTION",
+        filter_status=status,
+        filter_q=q,
     )
 
 
 @app.route("/api/sync", methods=["POST"])
+@login_required
 def api_sync():
     data = request.get_json(silent=True) or {}
     return jsonify(sync_from_x3(
@@ -898,11 +1183,13 @@ def api_sync():
 
 
 @app.route("/api/post/<invoice_number>", methods=["POST"])
+@login_required
 def api_post(invoice_number):
     return jsonify(post_to_firs(invoice_number))
 
 
 @app.route("/api/preview-payload/<invoice_number>")
+@login_required
 def api_preview_payload(invoice_number):
     inv = db_read_one("SELECT * FROM invoices WHERE invoice_number=?", (invoice_number,))
     if not inv:
@@ -912,21 +1199,29 @@ def api_preview_payload(invoice_number):
     if not payload:
         return jsonify({"ok": False, "error": error or "Failed to build payload"})
 
+    company_code = resolve_company_code(inv)
+    api_url, _api_key, supplier, _logo = get_company_api(company_code)
+
     subtotal = sum(to_float(l.get("amount", 0)) for l in lines)
     return jsonify({
         "ok": True,
         "invoice_number": inv["invoice_number"],
         "customer_name": inv["customer_name"],
+        "company_code": company_code,
+        "company_label": (COMPANY_API_CONFIG.get(company_code) or {}).get("name") or "Default",
+        "firs_env": FIRS_ENV,
         "subtotal": subtotal,
         "vat_amount": vat_amount,
         "grand_total": subtotal + vat_amount,
         "lines_count": len(lines),
-        "api_url": f"{API_URL}/invoice/generate",
+        "api_url": f"{api_url}/invoice/generate",
+        "supplier_name": supplier.get("name"),
         "payload": payload
     })
 
 
 @app.route("/api/error-details/<invoice_number>")
+@login_required
 def api_error_details(invoice_number):
     inv = db_read_one(
         "SELECT invoice_number, customer_name, status, error_message, api_response FROM invoices WHERE invoice_number=?",
@@ -953,10 +1248,28 @@ def api_error_details(invoice_number):
 
 
 @app.route("/api/post-bulk", methods=["POST"])
+@login_required
 def api_post_bulk():
-    pending = db_read("SELECT invoice_number FROM invoices WHERE status='pending'")
+    """Post a user-selected list of invoices to FIRS.
+
+    Body: {"invoice_numbers": ["ZAINV...", "ZAINV..."]}
+    Only invoices currently in 'pending' or 'failed' status are attempted.
+    """
+    data = request.get_json(silent=True) or {}
+    selected = data.get("invoice_numbers") or []
+    if not isinstance(selected, list) or not selected:
+        return jsonify({"ok": False, "error": "No invoices selected"}), 400
+
+    # Filter to only pending/failed so already-posted invoices aren't re-submitted
+    placeholders = ",".join("?" * len(selected))
+    rows = db_read(
+        f"SELECT invoice_number FROM invoices "
+        f"WHERE invoice_number IN ({placeholders}) AND status IN ('pending','failed')",
+        tuple(selected),
+    )
+
     results = []
-    for row in pending:
+    for row in rows:
         results.append({
             "invoice_number": row["invoice_number"],
             **post_to_firs(row["invoice_number"])
@@ -966,11 +1279,13 @@ def api_post_bulk():
         "ok": True,
         "posted": posted,
         "failed": len(results) - posted,
+        "skipped": len(selected) - len(results),
         "details": results
     })
 
 
 @app.route("/api/stats")
+@login_required
 def api_stats():
     try:
         all_stats = db_read("SELECT status, COUNT(*) as cnt FROM invoices GROUP BY status")
@@ -984,6 +1299,7 @@ def api_stats():
 
 
 @app.route("/api/test-x3")
+@login_required
 def api_test_x3():
     """Test Sage X3 connection."""
     reader = SageX3Reader(
@@ -1017,6 +1333,7 @@ def api_test_x3():
 
 
 @app.route("/download/<invoice_number>")
+@login_required
 def download_pdf(invoice_number):
     inv = db_read_one("SELECT * FROM invoices WHERE invoice_number=?", (invoice_number,))
     if not inv or inv["status"] != "posted":
@@ -1038,28 +1355,6 @@ def download_pdf(invoice_number):
 # MAIN
 # ============================================================
 
-def preload_data():
-    """Preload invoices and credit notes from Sage X3 on startup."""
-    print("\n  Preloading data from Sage X3...")
-
-    try:
-        result = sync_from_x3(date_from="2024-01-01")
-        if result.get("ok"):
-            total = result.get("synced", 0)
-            new = result.get("new", 0)
-            print(f"  [OK] Synced {total} documents ({new} new)")
-
-            # Show summary
-            stats = db_read("SELECT invoice_type, COUNT(*) as cnt FROM invoices GROUP BY invoice_type")
-            for s in stats:
-                print(f"       - {s['invoice_type']}: {s['cnt']}")
-        else:
-            print(f"  [WARN] Sync issue: {result.get('error', 'Unknown')}")
-    except Exception as e:
-        print(f"  [WARN] Could not preload: {e}")
-        print("         Data will be loaded when you click 'Sync from X3'")
-
-
 if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("  Nigeria E-Invoicing Dashboard (Sage X3)")
@@ -1074,12 +1369,24 @@ if __name__ == "__main__":
         print("\n  WARNING: X3_PASSWORD not set!")
         print("  Set environment variable or edit app_x3.py")
 
-    if not API_HEADERS.get("x-api-key"):
-        print("\n  WARNING: FIRS_API_KEY not set!")
-        print("  Set environment variable for FIRS posting")
+    # Per-company FIRS key status
+    print(f"\n  FIRS env: {FIRS_ENV}")
+    for code, cfg in COMPANY_API_CONFIG.items():
+        env_cfg = cfg.get(FIRS_ENV) or {}
+        has_key = bool(env_cfg.get("key"))
+        mark = "[OK]" if has_key else "[--]"
+        print(f"  {mark} {code:<6} {cfg['name']:<20} {env_cfg.get('url','(no url)')}")
+    if not any((cfg.get(FIRS_ENV) or {}).get("key") for cfg in COMPANY_API_CONFIG.values()):
+        print("\n  WARNING: No per-company FIRS keys are set for this FIRS_ENV!")
+        print("  Check SWIFT_FIRS_*_KEY and CHORUS_FIRS_*_KEY in .env")
 
-    # Preload invoices and credit notes from X3
-    preload_data()
+    # Show current DB state (no auto-sync - data is persistent)
+    try:
+        total_row = db_read_one("SELECT COUNT(*) as cnt FROM invoices")
+        print(f"\n  DB: {total_row['cnt'] if total_row else 0} invoices loaded from einvoice_x3.db")
+        print("      Click 'Sync from X3' in the dashboard to fetch new invoices.")
+    except Exception as e:
+        print(f"\n  [WARN] Could not read DB: {e}")
 
     print("\n" + "=" * 50)
     print("  Starting web server...")
