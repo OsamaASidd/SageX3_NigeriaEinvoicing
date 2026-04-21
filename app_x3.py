@@ -668,6 +668,27 @@ def build_payload(invoice_number):
 # POST TO FIRS
 # ============================================================
 
+def _mark_paid(api_url, headers, irn):
+    """Call PATCH /invoice/{irn} to mark the invoice as PAID.
+
+    This is required on every successful post — Cryptware's new flow.
+    NOTE: status change is one-time and irreversible at NRS. If the PATCH
+    fails we log but don't mark the local invoice as failed, since the
+    invoice is already generated and has a valid IRN.
+    """
+    try:
+        r = requests.patch(
+            f"{api_url}/invoice/{irn}",
+            headers=headers,
+            json={"payment_status": "PAID", "reference": irn},
+            timeout=30,
+        )
+        ok = r.status_code in (200, 204)
+        return ok, r.status_code, r.text[:500]
+    except Exception as e:
+        return False, 0, f"PATCH error: {e}"
+
+
 def post_to_firs(invoice_number):
     """Post an invoice to FIRS via Cryptware API.
 
@@ -738,8 +759,17 @@ def post_to_firs(invoice_number):
                 WHERE invoice_number=?
             """, (irn, qr_code, datetime.now().isoformat(), resp_text[:5000], invoice_number))
 
+            # Second leg: mark the invoice as PAID (required by Cryptware)
+            paid_ok, paid_status, paid_body = _mark_paid(api_url, headers, irn)
+            if not paid_ok:
+                print(f"[post_to_firs] PATCH /invoice/{irn} failed (status={paid_status}): {paid_body}")
+
             generate_pdf(invoice_number)
-            return {"ok": True, "irn": irn, "status": "posted", "id": inv_id}
+            return {
+                "ok": True, "irn": irn, "status": "posted", "id": inv_id,
+                "payment_status": "PAID" if paid_ok else "PENDING",
+                "payment_status_code": paid_status,
+            }
 
         elif resp.status_code == 409:
             # Duplicate - already exists
@@ -756,6 +786,12 @@ def post_to_firs(invoice_number):
                         error_message=NULL, api_response=?
                     WHERE invoice_number=?
                 """, (irn, qr_code, datetime.now().isoformat(), resp_text[:5000], invoice_number))
+
+                # Try to mark as PAID — may already be PAID (one-time update),
+                # in which case NRS returns 400. Either way we don't fail here.
+                paid_ok, paid_status, paid_body = _mark_paid(api_url, headers, irn)
+                if not paid_ok:
+                    print(f"[post_to_firs/409] PATCH /invoice/{irn} not applied (status={paid_status}): {paid_body}")
 
                 generate_pdf(invoice_number)
                 return {"ok": True, "irn": irn, "status": "posted", "note": "Already exists"}
