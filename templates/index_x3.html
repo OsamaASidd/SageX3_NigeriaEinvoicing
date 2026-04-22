@@ -69,6 +69,9 @@
         .preview-info { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; background: var(--slate50); padding: 10px; border-radius: 6px; font-size: 12px; }
         .preview-info dt { color: var(--slate500); font-size: 10px; text-transform: uppercase; }
         .preview-info dd { font-weight: 600; margin: 0; }
+        .payment-select { padding: 4px 6px; border: 1px solid var(--slate200); border-radius: 4px;
+            font-size: 11px; font-weight: 600; background: white; cursor: pointer; color: var(--amber); }
+        .payment-select:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-logout { padding: 5px 14px; border-radius: 4px; font-size: 12px; font-weight: 600;
             color: rgba(255,255,255,0.7); text-decoration: none; border: 1px solid rgba(255,255,255,0.2); transition: all 0.15s; }
         .btn-logout:hover { color: white; background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.4); }
@@ -138,7 +141,7 @@
         <tr>
             <th style="width:32px"><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th>
             <th>Invoice No.</th><th>Date</th><th>Company</th><th>Customer</th><th>Type</th>
-            <th>Status</th><th style="text-align:right">Amount (NGN)</th><th>Actions</th><th>PDF</th>
+            <th>Status</th><th>Payment</th><th style="text-align:right">Amount (NGN)</th><th>Actions</th><th>PDF</th>
         </tr>
     </thead>
     <tbody>
@@ -168,6 +171,22 @@
                     <button class="btn-ghost" onclick="showError('{{ inv.invoice_number }}')" title="View error" style="color:var(--red);font-size:11px;padding:2px 6px;margin-left:4px">Error</button>
                 {% else %}<span class="badge badge-pending">PENDING</span>{% endif %}
             </td>
+            <td>
+                {% set ps = (inv.payment_status or 'PENDING')|upper %}
+                {% if ps == 'PAID' %}
+                    <span class="badge badge-posted">PAID</span>
+                {% elif ps == 'REJECTED' %}
+                    <span class="badge badge-failed">REJECTED</span>
+                {% elif inv.status == 'posted' %}
+                    <select class="payment-select" data-inv="{{ inv.invoice_number }}" onchange="updatePaymentStatus(this)">
+                        <option value="" selected>PENDING</option>
+                        <option value="PAID">PAID</option>
+                        <option value="REJECTED">REJECTED</option>
+                    </select>
+                {% else %}
+                    <span style="font-size:11px;color:var(--slate400)">—</span>
+                {% endif %}
+            </td>
             {% if inv.invoice_type == 'Credit Note' %}
             <td style="text-align:right;font-weight:600;color:var(--red)">-{{ "{:,.2f}".format(inv.total_amount or 0) }}</td>
             {% else %}
@@ -191,7 +210,7 @@
         </tr>
         {% endfor %}
         {% if not invoices %}
-        <tr><td colspan="10" style="text-align:center;padding:40px;color:var(--slate400)">No invoices found. Click "Sync from X3" to load invoices.</td></tr>
+        <tr><td colspan="11" style="text-align:center;padding:40px;color:var(--slate400)">No invoices found. Click "Sync from X3" to load invoices.</td></tr>
         {% endif %}
     </tbody>
 </table>
@@ -277,6 +296,37 @@ function syncSage() {
             if (data.ok) { toast('Synced ' + data.synced + ' invoices (' + data.new + ' new)', 'success'); setTimeout(function(){location.reload();}, 800); }
             else { toast('Sync failed: ' + data.error, 'error'); btn.disabled = false; btn.textContent = 'Sync from X3'; }
         }).catch(function(e) { toast('Error: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Sync from X3'; });
+}
+
+function updatePaymentStatus(selectEl) {
+    var invNum = selectEl.getAttribute('data-inv');
+    var newStatus = selectEl.value;
+    if (!newStatus) return;
+    if (!confirm('Set payment status to ' + newStatus + ' for ' + invNum + '?\n\nThis is IRREVERSIBLE and will be synced to NRS.')) {
+        selectEl.value = '';
+        return;
+    }
+    selectEl.disabled = true;
+    fetch('/api/payment-status/' + encodeURIComponent(invNum), {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({payment_status: newStatus})
+    })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) {
+                toast(invNum + ' marked as ' + data.payment_status, 'success');
+                setTimeout(function(){location.reload();}, 800);
+            } else {
+                toast('Failed: ' + (data.error || 'Unknown'), 'error');
+                selectEl.disabled = false;
+                selectEl.value = '';
+            }
+        }).catch(function(e) {
+            toast('Error: ' + e.message, 'error');
+            selectEl.disabled = false;
+            selectEl.value = '';
+        });
 }
 
 function postInvoice(invNum, btnEl) {

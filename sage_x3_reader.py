@@ -459,46 +459,60 @@ class SageX3Reader:
     # ----------------------------------------------------------------
 
     def _build_customer_cache(self):
-        """Build customer lookup cache."""
+        """Build customer lookup cache.
+
+        Uses two REST calls:
+        1. BPCUSTOMER.$query — fast, gives customer IDs + names
+        2. BPARTNER.$details per customer — gives CRN (Site tax ID / TIN)
+
+        Falls back gracefully: if BPARTNER is unreachable, TIN stays empty.
+        """
         if self._customer_cache is not None:
             return self._customer_cache
 
         self._customer_cache = {}
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
-        # Fetch all customers via REST with proper URL format
-        # Key X3 fields: BPCNUM (ID), BPCNAM (Name), CRN (Tax ID/TIN)
+        # Step 1: Fetch customer list (IDs + names)
         url = f"{self.api_base}/BPCUSTOMER?representation=BPCUSTOMER.$query&count=5000"
-
         try:
-            headers = {"Accept": "application/json", "Content-Type": "application/json"}
-            # Increased timeout to 180 seconds for large customer lists
             response = self.session.get(url, headers=headers, timeout=180)
-
             if response.status_code == 200:
-                data = response.json()
-                customers = data.get("$resources", [])
-
-                for cust in customers:
+                for cust in response.json().get("$resources", []):
                     cust_id = to_str(cust.get("BPCNUM"))
                     if cust_id:
                         self._customer_cache[cust_id] = {
                             "customer_id": cust_id,
                             "name": to_str(cust.get("BPCNAM")),
-                            "tin": to_str(cust.get("CRN")),  # Tax Registration Number
-                            "email": to_str(cust.get("WEB", "")),  # or EMAIL field
-                            "phone": to_str(cust.get("TEL", "")),
-                            "address": to_str(cust.get("BPCADD", "")),
-                            "city": to_str(cust.get("CTY", "")),
-                            "country": to_str(cust.get("CRY", "NG")),
-                            "postal_code": to_str(cust.get("POSCOD", "")),
+                            "tin": "",
+                            "email": "",
+                            "phone": "",
+                            "address": "",
+                            "city": "",
+                            "country": to_str(cust.get("RCRY", "NG")),
+                            "postal_code": "",
                         }
             else:
-                logger.warning(f"Customer cache fetch failed: HTTP {response.status_code}")
+                logger.warning(f"Customer list fetch failed: HTTP {response.status_code}")
         except Exception as e:
-            logger.warning(f"Could not build customer cache: {e}")
-            # Continue without customer cache - invoice data will still work
+            logger.warning(f"Could not fetch customer list: {e}")
 
-        logger.info(f"Built customer cache: {len(self._customer_cache)} customers")
+        # Step 2: Enrich with TIN from BPARTNER.$details (CRN field = Site tax ID)
+        enriched = 0
+        for cust_id in list(self._customer_cache.keys()):
+            try:
+                bp_url = f"{self.api_base}/BPARTNER('{cust_id}')?representation=BPARTNER.$details"
+                resp = self.session.get(bp_url, headers=headers, timeout=30)
+                if resp.status_code == 200:
+                    bp = resp.json()
+                    crn = to_str(bp.get("CRN", "")).strip()
+                    if crn:
+                        self._customer_cache[cust_id]["tin"] = crn
+                        enriched += 1
+            except Exception:
+                pass  # Skip — TIN stays empty for this customer
+
+        logger.info(f"Built customer cache: {len(self._customer_cache)} customers, {enriched} with TIN")
         return self._customer_cache
 
     def get_customers(self):

@@ -340,6 +340,12 @@ def init_db():
             except:
                 pass  # Column already exists
 
+            # Payment status for NRS: PENDING (default), PAID, REJECTED
+            try:
+                conn.execute("ALTER TABLE invoices ADD COLUMN payment_status TEXT DEFAULT 'PENDING'")
+            except:
+                pass  # Column already exists
+
             conn.execute("""CREATE TABLE IF NOT EXISTS invoice_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invoice_number TEXT,
@@ -668,19 +674,19 @@ def build_payload(invoice_number):
 # POST TO FIRS
 # ============================================================
 
-def _mark_paid(api_url, headers, irn):
-    """Call PATCH /invoice/{irn} to mark the invoice as PAID.
+def _update_payment_status(api_url, headers, irn, payment_status):
+    """Call PATCH /invoice/{irn} to update payment status at NRS.
 
-    This is required on every successful post — Cryptware's new flow.
-    NOTE: status change is one-time and irreversible at NRS. If the PATCH
-    fails we log but don't mark the local invoice as failed, since the
-    invoice is already generated and has a valid IRN.
+    Args:
+        payment_status: "PAID" or "REJECTED"
+
+    This is a ONE-TIME, IRREVERSIBLE operation at NRS.
     """
     try:
         r = requests.patch(
             f"{api_url}/invoice/{irn}",
             headers=headers,
-            json={"payment_status": "PAID", "reference": irn},
+            json={"payment_status": payment_status, "reference": irn},
             timeout=30,
         )
         ok = r.status_code in (200, 204)
@@ -755,21 +761,13 @@ def post_to_firs(invoice_number):
             db_write("""
                 UPDATE invoices SET
                     status='posted', irn=?, qr_code=?, posted_at=?,
+                    payment_status='PENDING',
                     error_message=NULL, api_response=?
                 WHERE invoice_number=?
             """, (irn, qr_code, datetime.now().isoformat(), resp_text[:5000], invoice_number))
 
-            # Second leg: mark the invoice as PAID (required by Cryptware)
-            paid_ok, paid_status, paid_body = _mark_paid(api_url, headers, irn)
-            if not paid_ok:
-                print(f"[post_to_firs] PATCH /invoice/{irn} failed (status={paid_status}): {paid_body}")
-
             generate_pdf(invoice_number)
-            return {
-                "ok": True, "irn": irn, "status": "posted", "id": inv_id,
-                "payment_status": "PAID" if paid_ok else "PENDING",
-                "payment_status_code": paid_status,
-            }
+            return {"ok": True, "irn": irn, "status": "posted", "id": inv_id}
 
         elif resp.status_code == 409:
             # Duplicate - already exists
@@ -783,15 +781,10 @@ def post_to_firs(invoice_number):
                 db_write("""
                     UPDATE invoices SET
                         status='posted', irn=?, qr_code=?, posted_at=?,
+                        payment_status='PENDING',
                         error_message=NULL, api_response=?
                     WHERE invoice_number=?
                 """, (irn, qr_code, datetime.now().isoformat(), resp_text[:5000], invoice_number))
-
-                # Try to mark as PAID — may already be PAID (one-time update),
-                # in which case NRS returns 400. Either way we don't fail here.
-                paid_ok, paid_status, paid_body = _mark_paid(api_url, headers, irn)
-                if not paid_ok:
-                    print(f"[post_to_firs/409] PATCH /invoice/{irn} not applied (status={paid_status}): {paid_body}")
 
                 generate_pdf(invoice_number)
                 return {"ok": True, "irn": irn, "status": "posted", "note": "Already exists"}
@@ -1323,6 +1316,58 @@ def api_post_bulk():
         "skipped": len(selected) - len(results),
         "details": results
     })
+
+
+@app.route("/api/payment-status/<invoice_number>", methods=["POST"])
+@login_required
+def api_update_payment_status(invoice_number):
+    """Update payment status (PAID / REJECTED) at NRS via PATCH /invoice/{irn}.
+
+    This is a ONE-TIME, IRREVERSIBLE operation. Once set, cannot be changed.
+    Body: {"payment_status": "PAID"} or {"payment_status": "REJECTED"}
+    """
+    inv = db_read_one("SELECT * FROM invoices WHERE invoice_number=?", (invoice_number,))
+    if not inv:
+        return jsonify({"ok": False, "error": "Invoice not found"}), 404
+
+    if inv["status"] != "posted":
+        return jsonify({"ok": False, "error": "Invoice must be posted first"}), 400
+
+    current_ps = (inv.get("payment_status") or "PENDING").upper()
+    if current_ps in ("PAID", "REJECTED"):
+        return jsonify({"ok": False, "error": f"Payment status already set to {current_ps}. This cannot be changed."}), 400
+
+    irn = inv.get("irn")
+    if not irn or irn == "N/A":
+        return jsonify({"ok": False, "error": "No valid IRN — cannot update payment status"}), 400
+
+    data = request.get_json(silent=True) or {}
+    new_status = (data.get("payment_status") or "").upper()
+    if new_status not in ("PAID", "REJECTED"):
+        return jsonify({"ok": False, "error": "payment_status must be PAID or REJECTED"}), 400
+
+    # Resolve the company's API creds
+    company_code = resolve_company_code(inv)
+    api_url, api_key, _, _ = get_company_api(company_code)
+    if not api_key:
+        return jsonify({"ok": False, "error": f"No API key for company {company_code}"}), 400
+
+    headers = {"Content-Type": "application/json", "x-api-key": api_key}
+
+    ok, status_code, body = _update_payment_status(api_url, headers, irn, new_status)
+
+    if ok:
+        db_write(
+            "UPDATE invoices SET payment_status=? WHERE invoice_number=?",
+            (new_status, invoice_number),
+        )
+        return jsonify({"ok": True, "payment_status": new_status, "irn": irn})
+    else:
+        return jsonify({
+            "ok": False,
+            "error": f"NRS returned {status_code}: {body}",
+            "status_code": status_code,
+        }), 400
 
 
 @app.route("/api/stats")
