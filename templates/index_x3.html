@@ -272,9 +272,9 @@
 (function() {
     var now = new Date();
     var y = now.getFullYear(), m = String(now.getMonth()+1).padStart(2,'0');
-    document.getElementById('dateFrom').value = y + '-' + m + '-01';
     var last = new Date(y, now.getMonth()+1, 0);
     document.getElementById('dateTo').value = y + '-' + m + '-' + String(last.getDate()).padStart(2,'0');
+    // dateFrom is pre-set to 2026-01-01 by the server; don't override it
 })();
 
 function toast(msg, type) {

@@ -379,12 +379,12 @@ def sync_from_x3(date_from=None, date_to=None):
     if not date_to:
         date_to = today.strftime("%Y-%m-%d")
 
+    MIN_DATE = "2026-01-01"
+
     if not date_from:
-        # Default to 6 months back if no date provided
-        default_from = today.replace(day=1)
-        for _ in range(6):
-            default_from = (default_from - timedelta(days=1)).replace(day=1)
-        date_from = default_from.strftime("%Y-%m-%d")
+        date_from = MIN_DATE
+    elif date_from < MIN_DATE:
+        date_from = MIN_DATE
 
     # Connect to X3
     reader = SageX3Reader(
@@ -1181,12 +1181,7 @@ def index():
         total_pages = 1
         page = 1
 
-    # Default date range for sync (last 3 months)
     today = date.today()
-    default_from = today.replace(day=1)
-    # Go back 3 months
-    for _ in range(3):
-        default_from = (default_from - timedelta(days=1)).replace(day=1)
 
     return render_template(
         "index_x3.html",
@@ -1195,7 +1190,7 @@ def index():
         page=page,
         total_pages=total_pages,
         total=total,
-        default_from=default_from.strftime("%Y-%m-%d"),
+        default_from="2026-01-01",
         default_to=today.strftime("%Y-%m-%d"),
         company_filters=COMPANY_FILTERS,
         active_ctx=ctx,
@@ -1416,6 +1411,29 @@ def api_test_x3():
             "base_url": X3_BASE_URL,
             "folder": X3_FOLDER
         })
+
+
+@app.route("/api/diagnose-x3")
+@login_required
+def api_diagnose_x3():
+    """
+    Full step-by-step SOAP/REST diagnostic.
+    Hit this endpoint in the browser or with curl to see exactly where
+    the X3 connection or publication fetch breaks down.
+    """
+    reader = SageX3Reader(
+        base_url=X3_BASE_URL,
+        folder=X3_FOLDER,
+        username=X3_USERNAME,
+        password=X3_PASSWORD,
+    )
+    try:
+        report = reader.diagnose()
+    except Exception as e:
+        report = {"ok": False, "error": str(e)}
+    finally:
+        reader.close()
+    return jsonify(report)
 
 
 @app.route("/download/<invoice_number>")

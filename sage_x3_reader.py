@@ -211,11 +211,23 @@ class SageX3Reader:
             )
 
             if response.status_code == 200:
+                # Surface X3 SOAP-level errors (e.g. unknown publication)
+                if "Unknown web service" in response.text:
+                    import re as _re
+                    m = _re.search(r"<message>(.*?)</message>", response.text, _re.DOTALL)
+                    msg = m.group(1).strip() if m else "Unknown web service"
+                    logger.error(f"SOAP publication '{publication}' not found in X3: {msg}")
+                    raise RuntimeError(
+                        f"X3 publication '{publication}' does not exist in pool '{self.folder}'. "
+                        f"Ask your X3 admin to create the web service publication. Detail: {msg}"
+                    )
                 return self._parse_soap_list_response(response.text)
             else:
                 logger.error(f"SOAP query failed for {publication}: HTTP {response.status_code}")
                 return []
 
+        except RuntimeError:
+            raise  # let callers see publication-missing errors clearly
         except Exception as e:
             logger.error(f"SOAP query error for {publication}: {e}")
             return []
@@ -1263,6 +1275,107 @@ class SageX3Reader:
                 results[ep] = {"available": False, "error": str(e)}
 
         return results
+
+    def diagnose(self):
+        """
+        Run a step-by-step diagnostic of the X3 connection and SOAP publications.
+        Returns a dict with results at each stage so callers can identify exactly
+        where the fetch pipeline breaks.
+        """
+        import requests as _requests
+
+        report = {
+            "config": {
+                "base_url": self.base_url,
+                "soap_url": self.soap_url,
+                "folder": self.folder,
+                "username": self.username,
+                "password_set": bool(self.password),
+            },
+            "steps": {},
+        }
+
+        # ---- Step 1: raw HTTP reachability ----
+        try:
+            r = _requests.get(self.base_url, timeout=10, auth=(self.username, self.password))
+            report["steps"]["http_reach"] = {"ok": True, "status": r.status_code}
+        except Exception as e:
+            report["steps"]["http_reach"] = {"ok": False, "error": str(e)}
+
+        # ---- Step 2: REST auth (BPCUSTOMER) ----
+        rest_ok = self.connect()
+        report["steps"]["rest_auth"] = {"ok": rest_ok}
+        if not rest_ok:
+            return report
+
+        # ---- Step 3: SOAP ping (tiny query on each publication) ----
+        for pub in ["XSIH", "XCRN", "XBIC"]:
+            soap_body = f'''<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:wss="http://www.adonix.com/WSS">
+   <soapenv:Header/>
+   <soapenv:Body>
+      <wss:query>
+         <callContext>
+            <codeLang>ENG</codeLang>
+            <poolAlias>{self.folder}</poolAlias>
+            <poolId></poolId>
+            <requestConfig>adxwss.trace.on=off&amp;adxwss.beautify=true</requestConfig>
+         </callContext>
+         <publicName>{pub}</publicName>
+         <objectKeys></objectKeys>
+         <listSize>3</listSize>
+      </wss:query>
+   </soapenv:Body>
+</soapenv:Envelope>'''
+            try:
+                resp = self.session.post(
+                    self.soap_url,
+                    data=soap_body.encode("utf-8"),
+                    headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": '""'},
+                    timeout=30,
+                )
+                raw = resp.text
+                records = self._parse_soap_list_response(raw)
+                # Check for SOAP fault
+                fault = ""
+                import re as _re
+                fm = _re.search(r"<faultstring>(.*?)</faultstring>", raw, _re.DOTALL)
+                if fm:
+                    fault = fm.group(1).strip()
+                report["steps"][f"soap_{pub}"] = {
+                    "ok": resp.status_code == 200 and not fault,
+                    "http_status": resp.status_code,
+                    "records_returned": len(records),
+                    "fault": fault or None,
+                    "sample_record_keys": list(records[0].keys()) if records else [],
+                    "raw_snippet": raw[:600],
+                }
+            except Exception as e:
+                report["steps"][f"soap_{pub}"] = {"ok": False, "error": str(e)}
+
+        # ---- Step 4: sample SOAP read on first XSIH record ----
+        xsih_step = report["steps"].get("soap_XSIH", {})
+        if xsih_step.get("ok") and xsih_step.get("records_returned", 0) > 0:
+            try:
+                records = self._soap_query("XSIH", list_size=1)
+                first_num = to_str(records[0].get("NUM")) if records else ""
+                if first_num:
+                    full = self._soap_read("XSIH", "NUM", first_num)
+                    report["steps"]["soap_XSIH_read"] = {
+                        "ok": bool(full),
+                        "invoice_number": first_num,
+                        "top_level_keys": list(full.keys())[:30],
+                        "INVSTA": full.get("INVSTA"),
+                        "_INVSTA_label": full.get("_INVSTA_label"),
+                        "SALFCY": full.get("SALFCY"),
+                        "is_posted": self._is_posted(full),
+                        "line_tabs": [k for k in full if k.startswith("_lines_")],
+                    }
+            except Exception as e:
+                report["steps"]["soap_XSIH_read"] = {"ok": False, "error": str(e)}
+
+        return report
 
 
 # ============================================================
